@@ -1,0 +1,49 @@
+import type { NextConfig } from "next";
+import path from "node:path";
+
+const CHROMIUM_BIN =
+  "./node_modules/.pnpm/@sparticuz+chromium@*/node_modules/@sparticuz/chromium/bin/**";
+
+const nextConfig: NextConfig = {
+  turbopack: {
+    root: path.resolve(__dirname),
+  },
+  typedRoutes: true,
+  devIndicators: false,
+  // Ship the hand-crafted Goals bulk-import workbook INTO the template route's
+  // serverless function bundle (public/ assets are CDN-served and NOT guaranteed
+  // to be on the function filesystem, so a bare readFile would 500 in prod).
+  outputFileTracingIncludes: {
+    "/goals/template.xlsx": ["./public/templates/Altus-Goals-Template.xlsx"],
+    // @sparticuz/chromium's binary lives in its `bin/` dir and is unpacked at
+    // RUNTIME by executablePath() — nothing statically imports it, so Vercel's
+    // file-tracing drops it from the function ("input directory …/bin does not
+    // exist"). Force-include it into every route that renders a RICH letter PDF
+    // with headless Chromium. The @* matches whatever pnpm-hoisted version is
+    // installed (currently @sparticuz/chromium@149).
+    "/api/hr/letters/issue-rich": [CHROMIUM_BIN],
+    "/api/hr/letters/pdf": [CHROMIUM_BIN],
+    "/api/hr/letters/email-pdf": [CHROMIUM_BIN],
+  },
+  // Externalize heavy server packages so the bundler does NOT compile their huge
+  // trees into every route (the Sentry + OpenTelemetry + Prisma-instrumentation
+  // graph was adding ~50s to first-compile of EVERY page). They're require()'d at
+  // runtime from node_modules instead. Sentry has no build-time hook here (config
+  // isn't wrapped with withSentryConfig), so externalizing the runtime SDK is safe.
+  serverExternalPackages: [
+    "firebase-admin",
+    "pdfkit",
+    // Server-only headless-Chromium PDF renderer for rich ("Google Docs") HR
+    // letters. Externalized like pdfkit so their large native/binary trees are
+    // require()'d at runtime and never compiled into a route graph (and NEVER a
+    // client one). Imported lazily inside the server function that runs them.
+    "puppeteer-core",
+    "@sparticuz/chromium",
+    "@sentry/nextjs",
+    "@sentry/node",
+    "@opentelemetry/instrumentation",
+    "@prisma/instrumentation",
+  ],
+};
+
+export default nextConfig;

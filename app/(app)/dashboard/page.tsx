@@ -1,0 +1,261 @@
+import Link from "next/link";
+import type { Route } from "next";
+import { BarChart3, ArrowRight } from "lucide-react";
+import { DashboardHeader } from "@/components/layout/header";
+import { DashboardFooter } from "@/components/layout/footer";
+import { FilterBar } from "@/components/layout/filter-bar";
+import { KpiStrip } from "@/components/dashboard/kpi-strip";
+import { StatusTable } from "@/components/dashboard/status-table";
+import { StatusDistributionChart } from "@/components/dashboard/status-distribution";
+import { TopPerformersSection } from "@/components/dashboard/top-performers";
+import { ExecDashboard } from "@/components/dashboard/exec/exec-dashboard";
+import { AgingHeatmap } from "@/components/dashboard/aging-heatmap";
+import { WelcomeHero } from "@/components/dashboard/welcome-hero";
+import { DashboardLoadError } from "@/components/dashboard/dashboard-load-error";
+import { PageShell } from "@/components/layout/page-shell";
+import { listEmployees } from "@/lib/queries/employees";
+import { listDistinctSubjects } from "@/lib/queries/tasks";
+import { loadDashboardData } from "@/lib/queries/dashboard";
+import { getStatusDisplayMap } from "@/lib/queries/status-display";
+import { getMyDayCounts, getMyTodayTasks } from "@/lib/queries/my-day";
+import { MobileToday } from "@/components/dashboard/mobile-today";
+import { getCurrentEmployee } from "@/lib/auth/current";
+import { listWeekGoalsAsTasks } from "@/lib/weekly-goals/as-task-row";
+import { WeeklyGoalTaskGroup } from "@/components/weekly-goals/weekly-goal-task-group";
+import { parseFilters } from "@/lib/filters";
+import { comparisonForRange } from "@/lib/dashboard/comparison-period";
+import type { TaskStatus, StatusColorToken } from "@/db/enums";
+
+export const dynamic = "force-dynamic";
+
+interface PageProps {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}
+
+/**
+ * Dashboard. Loads DIRECTLY — the same single-pass `await Promise.all(...)`
+ * pattern the (fast) Tasks page uses. No Suspense/streaming, no per-attempt
+ * timeout, no retry wrapper: those turned the dashboard's heavier (but valid)
+ * rollup scans into a premature "taking longer than usual" error even when the
+ * query would have completed. A slow read just takes a moment and resolves;
+ * Next's route-level loading.tsx covers the wait.
+ */
+export default async function DashboardPage({ searchParams }: PageProps) {
+  const sp = await searchParams;
+  const filters = parseFilters(sp);
+
+  // Auth is cached for the request. `.catch → null` keeps the public-ish
+  // dashboard rendering even if the auth read hiccups (My Day just hides).
+  const me = await getCurrentEmployee().catch(() => null);
+
+  // Mobile home: phones open on "Today" (the user's overdue + due-today tasks)
+  // instead of the company dashboard. `?full=1` opts into the full dashboard.
+  const showFullOnMobile = sp.full === "1";
+
+  // One fan-out, awaited directly (no timeout/retry — that layer was what turned
+  // slow-but-valid reads into failures). Auxiliary reads (My Day, today's tasks,
+  // subjects, my goals) degrade to null/empty so they can never take down the
+  // page. The three CORE reads aren't degradable, so on a genuine error we show
+  // a friendly in-place Retry panel instead of throwing to the global boundary.
+  let loaded: [
+    Awaited<ReturnType<typeof listEmployees>>,
+    Awaited<ReturnType<typeof loadDashboardData>>,
+    Awaited<ReturnType<typeof getStatusDisplayMap>>,
+    Awaited<ReturnType<typeof getMyDayCounts>> | null,
+    Awaited<ReturnType<typeof getMyTodayTasks>> | null,
+    string[],
+    Awaited<ReturnType<typeof listWeekGoalsAsTasks>>,
+  ];
+  try {
+    loaded = await Promise.all([
+      listEmployees(),
+      loadDashboardData(filters),
+      getStatusDisplayMap(),
+      me ? getMyDayCounts(me.id).catch(() => null) : Promise.resolve(null),
+      me ? getMyTodayTasks(me.id).catch(() => null) : Promise.resolve(null),
+      listDistinctSubjects().catch(() => [] as string[]),
+      me
+        ? listWeekGoalsAsTasks({ scope: { employeeIds: [me.id] } }).catch(() => [])
+        : Promise.resolve([]),
+    ]);
+  } catch (err) {
+    console.error("[dashboard] core load failed:", err);
+    return (
+      <>
+        <DashboardHeader generatedAt={new Date()} />
+        <main>
+          <DashboardLoadError />
+        </main>
+        <DashboardFooter />
+      </>
+    );
+  }
+  const [allEmployees, data, statusDisplay, myDay, todayTasks, subjects, myGoals] =
+    loaded;
+
+  const statusLabels = Object.fromEntries(
+    Object.entries(statusDisplay).map(([k, v]) => [k, v.label]),
+  ) as Record<TaskStatus, string>;
+  const statusTones = Object.fromEntries(
+    Object.entries(statusDisplay).map(([k, v]) => [k, v.color]),
+  ) as Record<TaskStatus, StatusColorToken>;
+
+  const isEmpty = allEmployees.length === 0 && data.statusTable.length === 0;
+
+  const employeeOptions = allEmployees.map((e) => ({ value: e.id, label: e.name }));
+
+  // Pure in-memory avatar map from the already-loaded roster (no new query).
+  const avatarById: Record<string, string | null> = Object.fromEntries(
+    allEmployees.map((e) => [e.id, e.avatarUrl ?? null]),
+  );
+  const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+
+  // The mobile Today home replaces the dashboard on phones only when its data
+  // actually loaded — otherwise phones fall back to the regular dashboard.
+  const mobileToday =
+    !isEmpty && !showFullOnMobile && me && todayTasks ? todayTasks : null;
+
+  return (
+    <>
+      <DashboardHeader generatedAt={new Date()} />
+
+      {/* Sticky filter bar: WMS now uses the vertical left rail (no horizontal
+          top header), so the bar pins to the very top of the content column on
+          desktop; on phones it clears the rail's 56px fixed top bar (top-14). */}
+      <div
+        className={`sticky top-0 max-md:top-14 z-40 ${mobileToday ? "max-md:hidden" : ""}`}
+        style={{
+          background:
+            "linear-gradient(180deg, color-mix(in srgb, var(--color-surface-soft) 94%, transparent) 0%, color-mix(in srgb, var(--color-surface-soft) 86%, transparent) 100%)",
+          backdropFilter: "blur(14px) saturate(150%)",
+          WebkitBackdropFilter: "blur(14px) saturate(150%)",
+          borderBottom: "1px solid var(--color-hairline)",
+        }}
+      >
+        <FilterBar
+          employees={employeeOptions}
+          subjects={subjects}
+          initial={{
+            start: isoDay(filters.startDate ?? new Date()),
+            end: isoDay(filters.endDate ?? new Date()),
+            emp: filters.employeeIds,
+            view: filters.view,
+            dept: filters.departments,
+            prio: filters.priorities,
+            subj: filters.subjects,
+          }}
+        />
+      </div>
+
+      <main>
+        {isEmpty ? (
+          <WelcomeHero />
+        ) : (
+          <>
+            {/* Pinned "This week's goals" group at the top of My Day (design
+                §10) — visible on mobile Today + desktop. Display-only. */}
+            {myGoals.length > 0 && (
+              <PageShell as="div" width="full" py={false} className="mt-6">
+                <WeeklyGoalTaskGroup goals={myGoals} />
+              </PageShell>
+            )}
+            {mobileToday && me && (
+              <div className="md:hidden">
+                <MobileToday
+                  firstName={me.name.split(" ")[0] ?? me.name}
+                  tasks={mobileToday}
+                  doneToday={myDay?.doneToday ?? 0}
+                  statusLabels={statusLabels}
+                  statusTones={statusTones}
+                />
+              </div>
+            )}
+            <div className={mobileToday ? "max-md:hidden" : undefined}>
+              <KpiStrip
+                kpis={data.kpis}
+                summary={data.wmsSummary}
+                comparison={comparisonForRange(filters.startDate, filters.endDate)}
+              />
+              {/* Task Analytics deep-dive — on-demand route (load-neutral),
+                  surfaced for admins + managers (anyone with a downline). */}
+              {(me?.isAdmin || allEmployees.some((e) => e.managerId === me?.id)) && (
+                <PageShell as="div" width="full" py={false} className="mt-8">
+                  <Link
+                    href={"/dashboard/task-report" as Route}
+                    className="wg-rise group flex items-center justify-between gap-4 rounded-section px-6 py-5 max-md:px-4 max-md:py-4 transition-transform active:scale-[0.997]"
+                    style={{
+                      background:
+                        "linear-gradient(135deg, var(--color-altus-red), var(--color-altus-red-deep))",
+                      boxShadow: "0 14px 30px -16px rgba(168,4,0,0.6)",
+                    }}
+                  >
+                    <span className="flex items-center gap-3.5 min-w-0">
+                      <span className="inline-flex size-11 shrink-0 items-center justify-center rounded-xl bg-white/15 text-white">
+                        <BarChart3 size={22} strokeWidth={2.4} />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block text-[10.5px] font-black uppercase tracking-[0.16em] text-white/80">
+                          Task Analytics
+                        </span>
+                        <span
+                          className="block leading-tight text-white"
+                          style={{
+                            fontFamily: "var(--font-display), system-ui, sans-serif",
+                            fontWeight: 900,
+                            fontSize: 21,
+                            letterSpacing: "-0.02em",
+                          }}
+                        >
+                          Open the full Task Report
+                        </span>
+                        <span className="mt-0.5 block text-[12.5px] font-semibold text-white/85">
+                          Done-on-time spread · not-approved aging · initiator target-vs-actual
+                        </span>
+                      </span>
+                    </span>
+                    <ArrowRight
+                      size={22}
+                      strokeWidth={2.6}
+                      className="shrink-0 text-white transition-transform group-hover:translate-x-1"
+                    />
+                  </Link>
+                </PageShell>
+              )}
+              {/* Executive Control Room — surfaced above doer-status /
+                  top-performers per founder (2026-06-21). */}
+              <PageShell as="div" width="full" py={false} className="mt-12">
+                <ExecDashboard
+                  doneOnTime={data.doneOnTime}
+                  initiator={data.initiator}
+                  notApprovedAging={data.notApprovedAging}
+                  avatarById={avatarById}
+                  isAdmin={Boolean(me?.isAdmin)}
+                  meId={me?.id ?? null}
+                />
+              </PageShell>
+              <PageShell as="div" width="full" py={false} className="mt-12">
+                <div className="grid grid-cols-2 max-lg:grid-cols-1 gap-6">
+                  <div className="min-w-0">
+                    <StatusDistributionChart
+                      data={data.statusDistribution}
+                      labels={statusLabels}
+                      tones={statusTones}
+                      isAdmin={Boolean(me?.isAdmin)}
+                    />
+                  </div>
+                  <div className="min-w-0">
+                    <TopPerformersSection performers={data.topPerformers} avatarById={avatarById} />
+                  </div>
+                </div>
+              </PageShell>
+              <StatusTable rows={data.statusTable} view={filters.view} avatarById={avatarById} />
+              <AgingHeatmap rows={data.agingTable} cellTasks={data.agingHeatmapData.byCell} avatarById={avatarById} />
+            </div>
+          </>
+        )}
+      </main>
+
+      <DashboardFooter />
+    </>
+  );
+}
